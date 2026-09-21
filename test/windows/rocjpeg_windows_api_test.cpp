@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: MIT
 #define NOMINMAX
 #include <windows.h>
+#include <tlhelp32.h>
+#include <wincodec.h>
+#include <wrl/client.h>
 #include <rocjpeg/rocjpeg.h>
 
 #include <algorithm>
@@ -29,6 +32,61 @@ void Status(RocJpegStatus actual, RocJpegStatus expected, const char* operation)
 }
 void Hip(hipError_t status) {
     if (status != hipSuccess) throw std::runtime_error(hipGetErrorString(status));
+}
+void CheckNoAmf() {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    Require(snapshot != INVALID_HANDLE_VALUE, "enumerate loaded modules");
+    MODULEENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    bool found = false;
+    if (Module32FirstW(snapshot, &entry)) {
+        do {
+            if (_wcsnicmp(entry.szModule, L"amf", 3) == 0) {
+                std::wcerr << L"Unexpected AMF module: " << entry.szModule << L'\n';
+                found = true;
+            }
+        } while (Module32NextW(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    Require(!found, "native rocJPEG must not load an AMF runtime or component");
+}
+
+void CompareCpu(const std::filesystem::path& path, const std::vector<uint8_t>& actual,
+                uint32_t width, uint32_t height) {
+    using Microsoft::WRL::ComPtr;
+    const auto com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    Require(SUCCEEDED(com), "initialize CPU reference COM");
+    struct ComScope { ~ComScope() { CoUninitialize(); } } scope;
+    ComPtr<IWICImagingFactory> factory;
+    Require(SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                      IID_PPV_ARGS(&factory))), "create CPU JPEG reference");
+    ComPtr<IWICBitmapDecoder> decoder;
+    Require(SUCCEEDED(factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+                                                       WICDecodeMetadataCacheOnLoad, &decoder)), "open CPU JPEG reference");
+    ComPtr<IWICBitmapFrameDecode> frame;
+    Require(SUCCEEDED(decoder->GetFrame(0, &frame)), "read CPU JPEG frame");
+    UINT cpu_width = 0, cpu_height = 0;
+    Require(SUCCEEDED(frame->GetSize(&cpu_width, &cpu_height)) && cpu_width == width && cpu_height == height,
+            "CPU/GPU dimensions agree");
+    ComPtr<IWICFormatConverter> converter;
+    Require(SUCCEEDED(factory->CreateFormatConverter(&converter)), "create CPU RGB converter");
+    Require(SUCCEEDED(converter->Initialize(frame.Get(), GUID_WICPixelFormat24bppRGB, WICBitmapDitherTypeNone,
+                                           nullptr, 0, WICBitmapPaletteTypeCustom)), "convert CPU JPEG to RGB");
+    std::vector<uint8_t> expected(actual.size());
+    Require(SUCCEEDED(converter->CopyPixels(nullptr, width * 3, static_cast<UINT>(expected.size()), expected.data())),
+            "read CPU RGB pixels");
+    uint64_t total = 0;
+    int maximum = 0;
+    for (size_t i = 0; i < actual.size(); ++i) {
+        const int error = std::abs(int(actual[i]) - int(expected[i]));
+        total += error;
+        maximum = std::max(maximum, error);
+    }
+    const double mean = double(total) / actual.size();
+    std::cout << "CPU reference RGB: mean error=" << mean << ", max=" << maximum << '\n';
+    // IDCT rounding and chroma interpolation may differ. These bounds detect
+    // wrong pitch, field layout, channel order, or full/limited-range conversion.
+    Require(mean <= 1.5 && maximum <= 32, "hardware RGB differs from independent CPU decoder");
 }
 void SamePixels(const std::vector<uint8_t>& actual, const std::vector<uint8_t>& expected,
                 const char* operation) {
@@ -137,6 +195,18 @@ void ParserAndArguments() {
         Status(rocJpegStreamParse(unsupported.data(), unsupported.size(), stream.value),
                ROCJPEG_STATUS_JPEG_NOT_SUPPORTED, "progressive/CMYK fallback status");
     Status(rocJpegStreamParse(baseline.data(), baseline.size(), stream.value), ROCJPEG_STATUS_SUCCESS, "parser reusable after failure");
+
+    const auto invalid_segment = [&](std::initializer_list<uint8_t> segment) {
+        auto jpeg = baseline;
+        jpeg.insert(jpeg.begin() + 2, segment);
+        Status(rocJpegStreamParse(jpeg.data(), jpeg.size(), stream.value), ROCJPEG_STATUS_BAD_JPEG, "malformed JPEG tables");
+    };
+    invalid_segment({0xff, 0xdb, 0, 4, 0, 1}); // incomplete quantizer
+    invalid_segment({0xff, 0xc4, 0, 4, 0, 1}); // incomplete Huffman counts
+    invalid_segment({0xff, 0xdd, 0, 3, 0}); // truncated restart interval
+    auto bad_selector = baseline;
+    bad_selector[14] = 4;
+    Status(rocJpegStreamParse(bad_selector.data(), bad_selector.size(), stream.value), ROCJPEG_STATUS_BAD_JPEG, "invalid quantizer selector");
 }
 
 class GuardedRgb {
@@ -177,6 +247,7 @@ private:
 };
 
 void UnsupportedSampling(const std::filesystem::path& path_444, const std::filesystem::path& path_440,
+                         const std::filesystem::path& path_400,
                          Decoder& decoder) {
     const auto read = [](const std::filesystem::path& path) {
         std::ifstream input(path, std::ios::binary);
@@ -191,8 +262,8 @@ void UnsupportedSampling(const std::filesystem::path& path_444, const std::files
     // (2*x+7*y)%256), Pillow quality=95/subsampling=0 for 4:4:4. For 4:4:0,
     // subsampling=1 followed by a lossless TurboJPEG transpose gives 65x97.
     // The real 4:4:4 fixture previously reached a crashing driver path.
-    const std::array<std::vector<uint8_t>, 2> samples{read(path_444), read(path_440)};
-    const std::array<RocJpegChromaSubsampling, 2> formats{ROCJPEG_CSS_444, ROCJPEG_CSS_440};
+    const std::array<std::vector<uint8_t>, 3> samples{read(path_444), read(path_440), read(path_400)};
+    const std::array<RocJpegChromaSubsampling, 3> formats{ROCJPEG_CSS_444, ROCJPEG_CSS_440, ROCJPEG_CSS_400};
     for (size_t i = 0; i < samples.size(); ++i) {
         Stream stream;
         Status(rocJpegStreamParse(samples[i].data(), samples[i].size(), stream.value), ROCJPEG_STATUS_SUCCESS, "parse unsupported sampling");
@@ -200,7 +271,7 @@ void UnsupportedSampling(const std::filesystem::path& path_444, const std::files
         RocJpegChromaSubsampling chroma = ROCJPEG_CSS_UNKNOWN;
         uint32_t widths[ROCJPEG_MAX_COMPONENT]{}, heights[ROCJPEG_MAX_COMPONENT]{};
         Status(rocJpegGetImageInfo(decoder.value, stream.value, &components, &chroma, widths, heights), ROCJPEG_STATUS_SUCCESS, "unsupported sampling info");
-        Require(components == 3 && chroma == formats[i], "unsupported sampling metadata");
+        Require(components == (formats[i] == ROCJPEG_CSS_400 ? 1 : 3) && chroma == formats[i], "unsupported sampling metadata");
         Require(widths[0] && heights[0] && uint64_t(widths[0]) * heights[0] < 1024 * 1024, "unsupported fixture dimensions");
         GuardedRgb output(widths[0], heights[0]);
         RocJpegDecodeParams params{};
@@ -215,7 +286,7 @@ void UnsupportedSampling(const std::filesystem::path& path_444, const std::files
         const auto pixels = output.Pixels();
         Require(std::all_of(pixels.begin(), pixels.end(), [](uint8_t x) { return x == 0xa5; }), "unsupported decode wrote output");
     }
-    std::cout << "4:4:4/4:4:0 fallback: sync/async/batch guards passed\n";
+    std::cout << "4:4:4/4:4:0/4:0:0 fallback: sync/async/batch guards passed\n";
 }
 
 void DecodeSample(const std::filesystem::path& path, Decoder& decoder) {
@@ -232,7 +303,7 @@ void DecodeSample(const std::filesystem::path& path, Decoder& decoder) {
     bytes.clear();
     bytes.shrink_to_fit();
     if (!decoder.value)
-        Status(rocJpegCreate(ROCJPEG_BACKEND_HARDWARE, 0, &decoder.value), ROCJPEG_STATUS_SUCCESS, "create AMF hardware decoder");
+        Status(rocJpegCreate(ROCJPEG_BACKEND_HARDWARE, 0, &decoder.value), ROCJPEG_STATUS_SUCCESS, "create D3D11 hardware decoder");
     uint8_t components = 0;
     RocJpegChromaSubsampling chroma = ROCJPEG_CSS_UNKNOWN;
     uint32_t widths[ROCJPEG_MAX_COMPONENT]{}, heights[ROCJPEG_MAX_COMPONENT]{};
@@ -256,6 +327,7 @@ void DecodeSample(const std::filesystem::path& path, Decoder& decoder) {
     Require(std::all_of(untouched.begin(), untouched.end(), [](uint8_t x) { return x == 0xa5; }), "invalid decode wrote output");
     Status(rocJpegDecode(decoder.value, first.value, &params, &output.image), ROCJPEG_STATUS_SUCCESS, "hardware RGB decode");
     const auto expected = output.Pixels();
+    CompareCpu(path, expected, widths[0], heights[0]);
     const auto range = std::minmax_element(expected.begin(), expected.end());
     Require(*range.first != *range.second, "decoded image is constant/unwritten");
     for (int i = 0; i < 3; ++i) {
@@ -289,8 +361,64 @@ void DecodeSample(const std::filesystem::path& path, Decoder& decoder) {
     Status(rocJpegDecodeBatchedSync(decoder.value, images.data(), 2), ROCJPEG_STATUS_SUCCESS, "async batch sync");
     SamePixels(output.Pixels(), expected, "first async batch differs from single");
     SamePixels(other.Pixels(), expected, "second async batch differs from single");
-    std::cout << "AMF hardware RGB: " << widths[0] << 'x' << heights[0]
+    CheckNoAmf();
+    std::cout << "Native D3D11 hardware RGB: " << widths[0] << 'x' << heights[0]
               << ", repeat/batch/async/pitch guards passed\n";
+}
+
+void AsyncDifferentImages(const std::filesystem::path& first_path, const std::filesystem::path& second_path) {
+    const std::array paths{first_path, second_path};
+    Decoder decoder;
+    Status(rocJpegCreate(ROCJPEG_BACKEND_HARDWARE, 0, &decoder.value), ROCJPEG_STATUS_SUCCESS, "create concurrent decoder");
+    std::array<Stream, 2> streams;
+    std::array<std::unique_ptr<GuardedRgb>, 2> outputs;
+    uint32_t widths[2]{}, heights[2]{};
+    RocJpegDecodeParams params{};
+    params.output_format = ROCJPEG_OUTPUT_RGB;
+    for (size_t i = 0; i < paths.size(); ++i) {
+        std::ifstream file(paths[i], std::ios::binary);
+        Require(file.good(), "read async fixture");
+        const std::vector<uint8_t> data(std::istreambuf_iterator<char>{file}, {});
+        Status(rocJpegStreamParse(data.data(), data.size(), streams[i].value), ROCJPEG_STATUS_SUCCESS, "parse distinct async JPEG");
+        uint8_t components;
+        RocJpegChromaSubsampling css;
+        uint32_t w[ROCJPEG_MAX_COMPONENT]{}, h[ROCJPEG_MAX_COMPONENT]{};
+        Status(rocJpegGetImageInfo(decoder.value, streams[i].value, &components, &css, w, h), ROCJPEG_STATUS_SUCCESS, "async shape");
+        widths[i] = w[0]; heights[i] = h[0];
+        outputs[i] = std::make_unique<GuardedRgb>(w[0], h[0]);
+        Status(rocJpegDecodeAsync(decoder.value, streams[i].value, &params, &outputs[i]->image), ROCJPEG_STATUS_SUCCESS, "submit distinct async JPEG");
+        Status(rocJpegStreamDestroy(streams[i].value), ROCJPEG_STATUS_SUCCESS, "destroy submitted input");
+        streams[i].value = nullptr;
+    }
+    for (int i = 1; i >= 0; --i) {
+        Status(rocJpegDecodeSync(decoder.value, &outputs[i]->image), ROCJPEG_STATUS_SUCCESS, "sync in reverse order");
+        CompareCpu(paths[i], outputs[i]->Pixels(), widths[i], heights[i]);
+    }
+    // A partial asynchronous batch must release its submissions without touching
+    // caller outputs, and leave the decoder usable after the failed item.
+    Stream good, bad;
+    std::ifstream file(first_path, std::ios::binary);
+    const std::vector<uint8_t> data(std::istreambuf_iterator<char>{file}, {});
+    Status(rocJpegStreamParse(data.data(), data.size(), good.value), ROCJPEG_STATUS_SUCCESS, "parse rollback input");
+    const auto header = Header();
+    Status(rocJpegStreamParse(header.data(), header.size(), bad.value), ROCJPEG_STATUS_SUCCESS, "parse header-only metadata");
+    std::array handles{good.value, bad.value};
+    std::array parameters{params, params};
+    std::array images{outputs[0]->image, outputs[1]->image};
+    for (auto& output : outputs) output->Reset();
+    Status(rocJpegDecodeBatchedAsync(decoder.value, handles.data(), 2, parameters.data(), images.data()),
+           ROCJPEG_STATUS_BAD_JPEG, "reject missing JPEG tables and roll back batch");
+    for (auto& output : outputs) {
+        const auto pixels = output->Pixels();
+        Require(std::all_of(pixels.begin(), pixels.end(), [](uint8_t x) { return x == 0xa5; }), "failed async batch wrote output");
+    }
+    Status(rocJpegDecodeSync(decoder.value, &images[0]), ROCJPEG_STATUS_INVALID_PARAMETER, "rolled-back output is not pending");
+    Status(rocJpegDecode(decoder.value, good.value, &params, &outputs[0]->image), ROCJPEG_STATUS_SUCCESS, "decode after rollback");
+    CompareCpu(first_path, outputs[0]->Pixels(), widths[0], heights[0]);
+    Status(rocJpegDecodeAsync(decoder.value, good.value, &params, &outputs[0]->image), ROCJPEG_STATUS_SUCCESS, "pending work before destruction");
+    Status(rocJpegDestroy(decoder.value), ROCJPEG_STATUS_SUCCESS, "destroy decoder with pending work");
+    decoder.value = nullptr;
+    CheckNoAmf();
 }
 } // namespace
 
@@ -299,15 +427,21 @@ int wmain(int argc, wchar_t** argv) {
         ParserAndArguments();
         Decoder decoder;
         for (int i = 1; i < argc; ++i) {
-            if (std::wstring(argv[i]) == L"--unsupported") {
-                Require(i + 2 < argc, "--unsupported needs 4:4:4 and 4:4:0 JPEG fixtures");
-                UnsupportedSampling(std::filesystem::path(argv[i + 1]), std::filesystem::path(argv[i + 2]), decoder);
+            if (std::wstring(argv[i]) == L"--async-mixed") {
+                Require(i + 2 < argc, "--async-mixed needs two JPEG fixtures");
+                AsyncDifferentImages(std::filesystem::path(argv[i + 1]), std::filesystem::path(argv[i + 2]));
                 i += 2;
+            } else if (std::wstring(argv[i]) == L"--unsupported") {
+                Require(i + 3 < argc, "--unsupported needs 4:4:4, 4:4:0, and 4:0:0 JPEG fixtures");
+                UnsupportedSampling(std::filesystem::path(argv[i + 1]), std::filesystem::path(argv[i + 2]),
+                                    std::filesystem::path(argv[i + 3]), decoder);
+                i += 3;
             } else {
                 DecodeSample(std::filesystem::path(argv[i]), decoder);
             }
         }
         std::cout << "rocJPEG public API: " << checks << " checks passed\n";
+        CheckNoAmf();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "rocJPEG API test failed: " << error.what() << '\n';

@@ -1,7 +1,7 @@
 # Copyright (c) 2026 rocJPEG Windows contributors.
 # SPDX-License-Identifier: MIT
 
-# Windows builds use the driver-provided AMF decoder and the selected ROCm SDK.
+# Windows builds use the AMD D3D11 MJPEG decoder and the selected ROCm SDK.
 # Keep this path separate from the upstream Linux VA-API build.
 if(NOT ROCM_PATH)
   if(DEFINED ENV{ROCM_PATH} AND NOT "$ENV{ROCM_PATH}" STREQUAL "")
@@ -60,24 +60,6 @@ if(NOT GPU_TARGETS)
   set(GPU_TARGETS "${_rocjpeg_gpu_targets}" CACHE STRING "AMDGPU architectures for HIP conversion kernels")
 endif()
 
-set(AMF_ROOT "" CACHE PATH "AMF source checkout; empty fetches the pinned official headers")
-if(NOT AMF_ROOT)
-  include(FetchContent)
-  FetchContent_Declare(rocjpeg_amf
-    GIT_REPOSITORY https://github.com/GPUOpen-LibrariesAndSDKs/AMF.git
-    GIT_TAG d0b3e6dd544a5f207bb6a12a1ecb98532491176a
-    GIT_PROGRESS TRUE)
-  FetchContent_MakeAvailable(rocjpeg_amf)
-  set(AMF_ROOT "${rocjpeg_amf_SOURCE_DIR}")
-endif()
-if(EXISTS "${AMF_ROOT}/amf/public/include/core/Factory.h")
-  set(_rocjpeg_amf_include "${AMF_ROOT}/amf/public/include")
-elseif(EXISTS "${AMF_ROOT}/public/include/core/Factory.h")
-  set(_rocjpeg_amf_include "${AMF_ROOT}/public/include")
-else()
-  message(FATAL_ERROR "AMF_ROOT must contain amf/public/include/core/Factory.h (or public/include/core/Factory.h).")
-endif()
-
 unset(ROCJPEG_HIP_RUNTIME_LIBRARY CACHE)
 find_library(ROCJPEG_HIP_RUNTIME_LIBRARY NAMES amdhip64
   PATHS "${_rocjpeg_rocm_root}/lib" NO_DEFAULT_PATH REQUIRED)
@@ -111,8 +93,6 @@ target_include_directories(rocjpeg
     "$<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>"
     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
   PRIVATE
-    "${AMF_ROOT}"
-    "${_rocjpeg_amf_include}"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/windows")
 foreach(_rocjpeg_include IN LISTS _rocjpeg_hip_include_dirs)
   target_include_directories(rocjpeg PUBLIC "$<BUILD_INTERFACE:${_rocjpeg_include}>")
@@ -172,7 +152,7 @@ if(ROCJPEG_BUILD_WINDOWS_TESTS)
     "${CMAKE_CURRENT_SOURCE_DIR}/test/windows/rocjpeg_windows_api_test.cpp")
   target_compile_features(rocjpeg_windows_api_test PRIVATE cxx_std_20)
   set_target_properties(rocjpeg_windows_api_test PROPERTIES CXX_SCAN_FOR_MODULES OFF)
-  target_link_libraries(rocjpeg_windows_api_test PRIVATE rocjpeg::rocjpeg "${ROCJPEG_HIP_RUNTIME_LIBRARY}")
+  target_link_libraries(rocjpeg_windows_api_test PRIVATE rocjpeg::rocjpeg "${ROCJPEG_HIP_RUNTIME_LIBRARY}" windowscodecs ole32)
   add_custom_command(TARGET rocjpeg_windows_api_test POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E copy_if_different ${_rocjpeg_runtime_files}
       "$<TARGET_FILE_DIR:rocjpeg_windows_api_test>"
@@ -182,22 +162,27 @@ if(ROCJPEG_BUILD_WINDOWS_TESTS)
   add_test(NAME rocjpeg_windows_api_test COMMAND rocjpeg_windows_api_test)
   add_test(NAME rocjpeg_windows_api_decode_test COMMAND rocjpeg_windows_api_test
     "${CMAKE_CURRENT_SOURCE_DIR}/data/images/mug_420.jpg")
-  add_test(NAME rocjpeg_windows_api_gray_test COMMAND rocjpeg_windows_api_test
-    "${CMAKE_CURRENT_SOURCE_DIR}/data/images/mug_400.jpg")
+  add_test(NAME rocjpeg_windows_api_odd_test COMMAND rocjpeg_windows_api_test
+    "${CMAKE_CURRENT_SOURCE_DIR}/test/windows/baseline_420_odd.jpg"
+    "${CMAKE_CURRENT_SOURCE_DIR}/test/windows/baseline_422_odd.jpg")
   add_test(NAME rocjpeg_windows_api_422_test COMMAND rocjpeg_windows_api_test
     "${CMAKE_CURRENT_SOURCE_DIR}/data/images/mug_422.jpg")
   add_test(NAME rocjpeg_windows_api_mixed_test COMMAND rocjpeg_windows_api_test
     "${CMAKE_CURRENT_SOURCE_DIR}/data/images/mug_420.jpg"
     "${CMAKE_CURRENT_SOURCE_DIR}/data/images/mug_422.jpg"
-    "${CMAKE_CURRENT_SOURCE_DIR}/data/images/mug_400.jpg"
+    "${CMAKE_CURRENT_SOURCE_DIR}/test/windows/baseline_420_odd.jpg"
     "${CMAKE_CURRENT_SOURCE_DIR}/data/images/mug_420.jpg")
+  add_test(NAME rocjpeg_windows_api_async_mixed_test COMMAND rocjpeg_windows_api_test
+    --async-mixed "${CMAKE_CURRENT_SOURCE_DIR}/test/windows/baseline_420_odd.jpg"
+    "${CMAKE_CURRENT_SOURCE_DIR}/test/windows/baseline_422_odd.jpg")
   add_test(NAME rocjpeg_windows_api_unsupported_test COMMAND rocjpeg_windows_api_test
     --unsupported "${CMAKE_CURRENT_SOURCE_DIR}/test/windows/baseline_444.jpg"
     "${CMAKE_CURRENT_SOURCE_DIR}/test/windows/baseline_440.jpg"
+    "${CMAKE_CURRENT_SOURCE_DIR}/test/windows/baseline_400.jpg"
     "${CMAKE_CURRENT_SOURCE_DIR}/data/images/mug_420.jpg")
   set_tests_properties(rocjpeg_windows_api_test rocjpeg_windows_api_decode_test
-    rocjpeg_windows_api_gray_test rocjpeg_windows_api_422_test rocjpeg_windows_api_mixed_test
-    rocjpeg_windows_api_unsupported_test
+    rocjpeg_windows_api_odd_test rocjpeg_windows_api_422_test rocjpeg_windows_api_mixed_test
+    rocjpeg_windows_api_unsupported_test rocjpeg_windows_api_async_mixed_test
     PROPERTIES TIMEOUT 60)
 endif()
 
@@ -214,13 +199,8 @@ install(FILES
   DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}/rocjpeg")
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
   DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/rocjpeg")
-if(EXISTS "${AMF_ROOT}/LICENSE.txt")
-  install(FILES "${AMF_ROOT}/LICENSE.txt"
-    DESTINATION "${CMAKE_INSTALL_DATADIR}/licenses/rocjpeg" RENAME AMF-LICENSE.txt)
-endif()
-
 # Only rocjpeg's DLL/import library and headers are installed. The application
-# supplies its selected HIP runtime; AMF is loaded from the installed AMD driver.
+# supplies its selected HIP runtime. No AMF SDK or runtime is used.
 set(_rocjpeg_config [=[
 find_path(rocjpeg_HIP_INCLUDE_DIR hip/hip_runtime.h
   HINTS "${ROCM_PATH}" "${HIP_PATH}" "$ENV{ROCM_PATH}" "$ENV{HIP_PATH}"
@@ -245,6 +225,5 @@ install(FILES
 install(EXPORT rocjpeg-targets FILE rocjpeg-targets.cmake
   NAMESPACE rocjpeg:: DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/rocjpeg")
 
-message(STATUS "rocJPEG Windows backend: AMF (driver runtime), HIP ${GPU_TARGETS}")
+message(STATUS "rocJPEG Windows backend: native D3D11 MJPEG (no AMF), HIP ${GPU_TARGETS}")
 message(STATUS "rocJPEG ROCm SDK: ${_rocjpeg_rocm_root}")
-message(STATUS "rocJPEG AMF headers: ${_rocjpeg_amf_include}")

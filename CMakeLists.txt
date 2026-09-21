@@ -24,13 +24,9 @@
 cmake_minimum_required(VERSION 3.15)
 
 if(WIN32)
-  option(ROCJPEG_ENABLE_WINDOWS_AMF "Build the Windows AMF hardware backend" ON)
-  if(ROCJPEG_ENABLE_WINDOWS_AMF)
-    cmake_minimum_required(VERSION 3.24)
-    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/WindowsAMF.cmake")
-    return()
-  endif()
-  message(FATAL_ERROR "Windows requires ROCJPEG_ENABLE_WINDOWS_AMF=ON; the legacy backend uses Linux VA-API.")
+  cmake_minimum_required(VERSION 3.24)
+  include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/WindowsD3D11.cmake")
+  return()
 endif()
 
 # ROCM Path

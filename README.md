@@ -15,29 +15,29 @@ rocJPEG is a high performance JPEG decode SDK for AMD GPUs. Using the rocJPEG AP
 * YUV 4:2:0
 * YUV 4:0:0
 
-This Windows AMF fork tracks `projects/rocjpeg` from [ROCm/rocm-systems](https://github.com/ROCm/rocm-systems/tree/73e42c4112d08e05170340f3fd2b5e291c2d4957/projects/rocjpeg), commit `73e42c4112d08e05170340f3fd2b5e291c2d4957` (rocJPEG 1.10.0).
+This Windows fork tracks `projects/rocjpeg` from [ROCm/rocm-systems](https://github.com/ROCm/rocm-systems/tree/73e42c4112d08e05170340f3fd2b5e291c2d4957/projects/rocjpeg), commit `73e42c4112d08e05170340f3fd2b5e291c2d4957` (rocJPEG 1.10.0). Its 13 public API signatures and data structures were also checked against rocm-systems `f437a7135fa67b96b48da4baeb72d5f75c406052` on 2026-09-22; Windows DLL export annotations are maintained in this fork.
 
-## Windows AMF backend (this fork)
+## Native Windows D3D11 backend (this fork)
 
-The Windows backend uses the AMD display driver's AMF JPEG decoder and HIP
-conversion kernels. It requires a Windows ROCm SDK with `clang++.exe`, the Visual
-Studio C++ build tools, Windows SDK, CMake 3.24 or newer, and Ninja. The AMF runtime
-comes from the installed AMD driver and is not bundled by this project.
+The Windows backend calls the AMD display driver's D3D11 MJPEG decoder directly
+and converts the decoded GPU surface with HIP. **No AMF headers, libraries, or
+runtime are required or loaded.** It requires a Windows ROCm SDK with
+`clang++.exe`, Visual Studio C++ build tools, Windows SDK, CMake 3.24 or newer,
+Ninja, and an AMD adapter exposing the D3D11 MJPEG profile. See
+[the Windows backend notes](docs/windows.md) for the driver contract and tests.
 
 From a Visual Studio developer PowerShell, select your SDK and GPU architecture:
 
 ```powershell
 $rocm = 'C:/path/to/_rocm_sdk_core'
-cmake -S . -B build/windows -G 'Ninja Multi-Config' `
+cmake -S . -B build/windows-d3d11 -G 'Ninja Multi-Config' `
   "-DROCM_PATH=$rocm" -DGPU_TARGETS=gfx1151 -DROCJPEG_BUILD_WINDOWS_TESTS=ON
-cmake --build build/windows --config Release --parallel 32
-ctest --test-dir build/windows -C Release --output-on-failure
-cmake --install build/windows --config Release --prefix build/install
+cmake --build build/windows-d3d11 --config Release --parallel 32
+ctest --test-dir build/windows-d3d11 -C Release --output-on-failure
+cmake --install build/windows-d3d11 --config Release --prefix build/install
 ```
 
-The build fetches AMF headers from pinned official commit
-`d0b3e6dd544a5f207bb6a12a1ecb98532491176a`. Set `-DAMF_ROOT=C:/path/to/AMF`
-to use an existing checkout. Split ROCm wheel installations automatically use
+The native backend is selected automatically on Windows. Split ROCm wheel installations automatically use
 the sibling `_rocm_sdk_devel` headers; `ROCJPEG_ROCM_DEVEL_PATH` overrides that
 location. `GPU_TARGETS` accepts a semicolon-separated architecture list and
 defaults to `native`.
@@ -59,35 +59,36 @@ Windows System32 can otherwise take precedence over `PATH`.
 
 The Windows backend implements all 13 public APIs from rocJPEG 1.10.0,
 including `rocJpegDecodeAsync`/`rocJpegDecodeSync` and their batched variants.
-Async submission returns before output pixels are copied; the matching sync
-call completes the decode. Input streams own their compressed bytes, and
-submitted async work retains its input even if the stream is subsequently
-destroyed. Output buffers and destination structures must remain alive until
+Async submission copies compressed bytes into the driver and returns before
+output pixels are copied; the matching sync call completes the decode. Submitted
+work owns its decoder surface even if the input stream is subsequently destroyed.
+Output buffers and destination structures must remain alive until
 sync completes. Finish any caller-side asynchronous writes to these buffers
 before submitting them to rocJPEG.
 
 Validated on Windows 11, Radeon 8060S (`gfx1151`), ROCm SDK 10.2.0 / HIP
 7.16.26373, and AMD clang 24:
 
-* Baseline 8-bit JPEG 4:2:0, 4:2:2, and grayscale 4:0:0 hardware decoding.
-* Real images at 3840×2160 and 979×546, repeated and batched decoding, and
-  changes in image dimensions and subsampling on one decoder.
+* Baseline 8-bit JPEG 4:2:0 and 4:2:2 hardware decoding, with pixel comparison
+  against the independent Windows Imaging Component CPU decoder.
+* Real images at 3840×2160 and generated odd-sized images with restart markers,
+  repeated and batched decoding, and changes in dimensions and subsampling.
 * All 13 API entry points, malformed and truncated input against an inaccessible
-  guard page, async input lifetime, destination pitches, and overwrite guards.
+  guard page, malformed tables, async input lifetime, reverse-order completion,
+  failed batch rollback, destination pitches, and overwrite guards.
 * 406 GPU conversion cases covering NV12, YUY2, Y8, BGRA, and RGBA sources;
   native, planar YUV, luma, RGB, and planar RGB outputs; crops and odd sizes.
-* Installed-package `find_package(rocjpeg CONFIG REQUIRED)` compilation,
-  linking, and execution.
+* Loaded-module checks that fail if an AMF runtime/component enters the process.
 
 Progressive JPEG, CMYK, arithmetic coding, and unsupported sampling return
 `ROCJPEG_STATUS_JPEG_NOT_SUPPORTED`; this backend does not silently decode on
 the CPU. Applications can use that status to choose their CPU fallback.
-Windows 4:4:4 and 4:4:0 image metadata can be parsed, but decoding returns
-`ROCJPEG_STATUS_JPEG_NOT_SUPPORTED` before entering AMF. The tested AMD driver
-crashed when initializing its BGRA decode path for a real 4:4:4 JPEG; callers
-must use a fallback for these formats. The regression test includes generated
-97×65 baseline 4:4:4 and 65×97 4:4:0 JPEGs and checks synchronous, asynchronous, and batched
-rejection without modifying output. Resizing is not implemented by this backend;
+Windows 4:4:4, 4:4:0, and grayscale 4:0:0 metadata can be parsed, but decoding
+returns `ROCJPEG_STATUS_JPEG_NOT_SUPPORTED`. The tested AMD driver produces an
+incorrect row layout for grayscale (including through the previous AMF path),
+so applications must use their fallback for these formats. Tests check
+synchronous, asynchronous, and batched rejection without modifying output.
+Resizing is not implemented by this backend;
 nonzero target dimensions must match the selected crop. Hybrid backend
 creation returns `ROCJPEG_STATUS_NOT_IMPLEMENTED`.
 

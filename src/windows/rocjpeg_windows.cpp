@@ -1,8 +1,8 @@
 /* Copyright (c) 2026 rocJPEG Windows contributors.
  * SPDX-License-Identifier: MIT
  *
- * Windows VCN JPEG decoding through AMD AMF. Decoded pixels stay on the GPU:
- * AMF/D3D11 -> shared D3D11/D3D12 texture -> shared linear D3D12 buffer -> HIP.
+ * Windows VCN JPEG decoding through the AMD D3D11 MJPEG profile. No AMF is used.
+ * Decoded pixels stay on the GPU: D3D11 -> shared D3D12 buffer -> HIP.
  */
 
 #ifndef NOMINMAX
@@ -13,10 +13,9 @@
 #include <d3d10.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
+#include <initguid.h>
+#include <dxva.h>
 #include <wrl/client.h>
-#include <core/Factory.h>
-#include <core/Version.h>
-#include <components/VideoDecoderUVD.h>
 
 #include "rocjpeg_windows_kernels.hpp"
 
@@ -44,9 +43,11 @@ void Check(HRESULT status) {
 void CheckHip(hipError_t status) {
     if (status != hipSuccess) throw Failure{status == hipErrorOutOfMemory ? ROCJPEG_STATUS_OUTOF_MEMORY : ROCJPEG_STATUS_RUNTIME_ERROR};
 }
-void CheckAmf(AMF_RESULT status) {
-    if (status != AMF_OK) throw Failure{status == AMF_OUT_OF_MEMORY ? ROCJPEG_STATUS_OUTOF_MEMORY : ROCJPEG_STATUS_EXECUTION_FAILED};
-}
+
+// AMD's profile predates the standard Windows 11 MJPEG profiles. Its picture
+// buffer is DXVA_PictureParameters, not DXVA_PicParams_MJPEG. See docs/windows.md.
+constexpr GUID kAmdMjpeg = {0xd1c20509, 0xae7b, 0x4e72, {0xae, 0x3b, 0x49, 0xf8, 0x8d, 0x58, 0x99, 0x2f}};
+static_assert(sizeof(DXVA_PictureParameters) == 44);
 
 template <typename F> RocJpegStatus Guard(F&& fn) noexcept {
     try { return fn(); }
@@ -61,11 +62,6 @@ struct WinHandle {
     WinHandle() = default;
     WinHandle(const WinHandle&) = delete;
     WinHandle& operator=(const WinHandle&) = delete;
-};
-
-struct Module {
-    HMODULE value = nullptr;
-    ~Module() { if (value) FreeLibrary(value); }
 };
 
 class DeviceScope {
@@ -86,15 +82,19 @@ struct JpegStream {
     uint32_t width = 0, height = 0;
     uint8_t components = 0;
     RocJpegChromaSubsampling subsampling = ROCJPEG_CSS_UNKNOWN;
+    bool complete_tables = false;
 
     RocJpegStatus Parse(const uint8_t* data, size_t length) {
         bytes.clear(); width = height = components = 0; subsampling = ROCJPEG_CSS_UNKNOWN;
+        complete_tables = false;
         if (!data || length < 4 || data[0] != 0xff || data[1] != 0xd8)
             return ROCJPEG_STATUS_BAD_JPEG;
         if (length > std::numeric_limits<uint32_t>::max()) return ROCJPEG_STATUS_JPEG_NOT_SUPPORTED;
         bool frame = false, scan = false, end = false;
         int adobe_transform = -1;
         std::array<uint8_t, 3> ids{};
+        std::array<uint8_t, 3> quantizers{};
+        unsigned quant_mask = 0, dc_mask = 0, ac_mask = 0;
         size_t pos = 2;
         while (pos < length) {
             if (data[pos++] != 0xff) return ROCJPEG_STATUS_BAD_JPEG;
@@ -108,7 +108,44 @@ struct JpegStream {
             const size_t size = (size_t(data[pos]) << 8) | data[pos + 1];
             if (size < 2 || size > length - pos) return ROCJPEG_STATUS_BAD_JPEG;
             const uint8_t* segment = data + pos + 2;
-            if (marker == 0xee && size >= 14 && std::memcmp(segment, "Adobe", 5) == 0) {
+            if (marker == 0xdb) {
+                size_t offset = 0;
+                while (offset < size - 2) {
+                    const unsigned table = segment[offset++];
+                    if ((table & 15) > 3) return ROCJPEG_STATUS_BAD_JPEG;
+                    if (table >> 4) return ROCJPEG_STATUS_JPEG_NOT_SUPPORTED;
+                    if (size - 2 - offset < 64) return ROCJPEG_STATUS_BAD_JPEG;
+                    for (unsigned i = 0; i < 64; ++i) if (!segment[offset + i]) return ROCJPEG_STATUS_BAD_JPEG;
+                    quant_mask |= 1u << table;
+                    offset += 64;
+                }
+            } else if (marker == 0xc4) {
+                size_t offset = 0;
+                while (offset < size - 2) {
+                    const unsigned table = segment[offset++];
+                    if ((table & 15) > 3 || (table >> 4) > 1 || size - 2 - offset < 16)
+                        return ROCJPEG_STATUS_BAD_JPEG;
+                    unsigned symbols = 0;
+                    int codes = 1;
+                    for (unsigned i = 0; i < 16; ++i) {
+                        const unsigned count = segment[offset++];
+                        symbols += count;
+                        codes = 2 * codes - static_cast<int>(count);
+                        if (codes <= 0) return ROCJPEG_STATUS_BAD_JPEG;
+                    }
+                    if (!symbols || symbols > 256 || symbols > size - 2 - offset)
+                        return ROCJPEG_STATUS_BAD_JPEG;
+                    for (unsigned i = 0; i < symbols; ++i) {
+                        const unsigned value = segment[offset + i];
+                        if ((table >> 4) == 0 ? value > 11 : (value & 15) > 10 || (!(value & 15) && value != 0 && value != 0xf0))
+                            return ROCJPEG_STATUS_BAD_JPEG;
+                    }
+                    (table >> 4 ? ac_mask : dc_mask) |= 1u << (table & 15);
+                    offset += symbols;
+                }
+            } else if (marker == 0xdd) {
+                if (size != 4) return ROCJPEG_STATUS_BAD_JPEG;
+            } else if (marker == 0xee && size >= 14 && std::memcmp(segment, "Adobe", 5) == 0) {
                 adobe_transform = segment[11];
             } else if ((marker >= 0xc0 && marker <= 0xcf) && marker != 0xc4 && marker != 0xc8 && marker != 0xcc) {
                 if (marker != 0xc0) return ROCJPEG_STATUS_JPEG_NOT_SUPPORTED;
@@ -122,6 +159,8 @@ struct JpegStream {
                 if (size != size_t(8 + 3 * components)) return ROCJPEG_STATUS_BAD_JPEG;
                 for (unsigned c = 0; c < components; ++c) {
                     ids[c] = segment[6 + 3 * c];
+                    quantizers[c] = segment[8 + 3 * c];
+                    if (quantizers[c] > 3) return ROCJPEG_STATUS_BAD_JPEG;
                     const unsigned sample = segment[7 + 3 * c];
                     if (!(sample >> 4) || !(sample & 15) || (sample >> 4) > 4 || (sample & 15) > 4)
                         return ROCJPEG_STATUS_BAD_JPEG;
@@ -151,6 +190,13 @@ struct JpegStream {
                 if (segment[0] != components) return ROCJPEG_STATUS_JPEG_NOT_SUPPORTED;
                 if (size != size_t(6 + 2 * components)) return ROCJPEG_STATUS_BAD_JPEG;
                 for (unsigned c = 0; c < components; ++c) if (segment[1 + 2 * c] != ids[c]) return ROCJPEG_STATUS_JPEG_NOT_SUPPORTED;
+                complete_tables = true;
+                for (unsigned c = 0; c < components; ++c) {
+                    const unsigned selectors = segment[2 + 2 * c];
+                    if ((selectors >> 4) > 3 || (selectors & 15) > 3) return ROCJPEG_STATUS_BAD_JPEG;
+                    complete_tables = complete_tables && (quant_mask & (1u << quantizers[c])) &&
+                        (dc_mask & (1u << (selectors >> 4))) && (ac_mask & (1u << (selectors & 15)));
+                }
                 if (segment[1 + 2 * components] != 0 || segment[2 + 2 * components] != 63 || segment[3 + 2 * components] != 0)
                     return ROCJPEG_STATUS_JPEG_NOT_SUPPORTED;
                 pos += size; scan = true;
@@ -191,15 +237,20 @@ struct TransferBuffer {
     }
 };
 
+struct DecodeSession {
+    ComPtr<ID3D11VideoDecoder> decoder;
+    ComPtr<ID3D11Texture2D> texture;
+    ComPtr<ID3D11VideoDecoderOutputView> output;
+    uint32_t width = 0, height = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+};
+
 struct Submission {
-    amf::AMFComponentPtr decoder;
-    amf::AMFBufferPtr compressed;
+    std::shared_ptr<DecodeSession> session;
+    ComPtr<ID3D11Query> completion;
     RocJpegDecodeParams params{};
     uint32_t width = 0, height = 0;
     RocJpegChromaSubsampling subsampling = ROCJPEG_CSS_UNKNOWN;
-    amf::AMF_SURFACE_FORMAT format = amf::AMF_SURFACE_UNKNOWN;
-    bool owns_decoder = false;
-    ~Submission() { if (owns_decoder && decoder) (void)decoder->Terminate(); }
 };
 
 class Decoder {
@@ -212,12 +263,12 @@ public:
         if (hip_stream_) (void)hipStreamSynchronize(hip_stream_);
         // In an error path the D3D submission might not yet have been waited by HIP.
         WaitForQueue();
+        for (const auto& [destination, job] : pending_) (void)WaitForDecode(*job);
         pending_.clear();
+        reusable_.reset();
         transfer_.reset();
         if (hip_fence_) (void)hipDestroyExternalSemaphore(hip_fence_);
         if (hip_stream_) (void)hipStreamDestroy(hip_stream_);
-        if (decoder_) { decoder_->Terminate(); decoder_ = nullptr; }
-        if (context_) { context_->Terminate(); context_ = nullptr; }
         if (got_device && previous != device_) (void)hipSetDevice(previous);
     }
 
@@ -245,6 +296,17 @@ public:
                                &device11_, &level, &context11_));
         Check(device11_.As(&device11_5_));
         Check(context11_.As(&context11_4_));
+        Check(device11_.As(&video_device_));
+        Check(context11_.As(&video_context_));
+        bool found_profile = false;
+        for (UINT i = 0; i < video_device_->GetVideoDecoderProfileCount(); ++i) {
+            GUID profile{};
+            Check(video_device_->GetVideoDecoderProfile(i, &profile));
+            if (profile == kAmdMjpeg) { found_profile = true; break; }
+        }
+        BOOL nv12 = FALSE;
+        if (!found_profile || FAILED(video_device_->CheckVideoDecoderFormat(&kAmdMjpeg, DXGI_FORMAT_NV12, &nv12)) || !nv12)
+            throw Failure{ROCJPEG_STATUS_HW_JPEG_DECODER_NOT_SUPPORTED};
         ComPtr<ID3D10Multithread> multithread;
         Check(context11_.As(&multithread));
         multithread->SetMultithreadProtected(TRUE);
@@ -264,34 +326,13 @@ public:
         fence_desc.handle.win32.handle = fence_handle.value;
         CheckHip(hipImportExternalSemaphore(&hip_fence_, &fence_desc));
 
-        module_.value = LoadLibraryExW(AMF_DLL_NAME, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-        if (!module_.value) throw Failure{ROCJPEG_STATUS_HW_JPEG_DECODER_NOT_SUPPORTED};
-        const auto amf_init = reinterpret_cast<AMFInit_Fn>(GetProcAddress(module_.value, AMF_INIT_FUNCTION_NAME));
-        if (!amf_init) throw Failure{ROCJPEG_STATUS_HW_JPEG_DECODER_NOT_SUPPORTED};
-        CheckAmf(amf_init(AMF_FULL_VERSION, &factory_));
-        CheckAmf(factory_->CreateContext(&context_));
-        CheckAmf(context_->InitDX11(device11_.Get()));
-        CheckAmf(factory_->CreateComponent(context_, AMFVideoDecoderUVD_MJPEG, &decoder_));
-        amf::AMFCapsPtr caps;
-        CheckAmf(decoder_->GetCaps(&caps));
-        if (caps->GetAccelerationType() != amf::AMF_ACCEL_HARDWARE)
-            throw Failure{ROCJPEG_STATUS_HW_JPEG_DECODER_NOT_SUPPORTED};
-        amf::AMFIOCapsPtr input_caps;
-        CheckAmf(caps->GetInputCaps(&input_caps));
-        input_caps->GetWidthRange(&min_width_, &max_width_);
-        input_caps->GetHeightRange(&min_height_, &max_height_);
     }
 
     RocJpegStatus Decode(const JpegStream& jpeg, const RocJpegDecodeParams& params, RocJpegImage& destination) {
         if (!pending_.empty()) return ROCJPEG_STATUS_EXECUTION_FAILED;
         DeviceScope scope(device_);
-        try {
-            auto job = Submit(jpeg, params, true);
-            return Finish(*job, destination);
-        } catch (...) {
-            if (decoder_initialized_) (void)decoder_->Flush();
-            throw;
-        }
+        auto job = Submit(jpeg, params, true);
+        return Finish(*job, destination);
     }
 
     RocJpegStatus DecodeAsync(const JpegStream& jpeg, const RocJpegDecodeParams& params, RocJpegImage* destination) {
@@ -312,48 +353,142 @@ public:
     }
 
     bool IsPending(RocJpegImage* destination) const { return pending_.count(destination) != 0; }
-    void DiscardPending(RocJpegImage* destination) { pending_.erase(destination); }
+    void DiscardPending(RocJpegImage* destination) {
+        const auto it = pending_.find(destination);
+        if (it != pending_.end()) { (void)WaitForDecode(*it->second); pending_.erase(it); }
+    }
 
     std::mutex mutex;
 
 private:
+    std::shared_ptr<DecodeSession> CreateSession(uint32_t width, uint32_t height, DXGI_FORMAT format) {
+        // VCN decode surfaces use 64-pixel padding. The picture buffer below
+        // carries the unpadded image size; padding must never reach the output.
+        D3D11_VIDEO_DECODER_DESC desc{kAmdMjpeg, (width + 63u) & ~63u, (height + 63u) & ~63u, format};
+        BOOL supported = FALSE;
+        if (FAILED(video_device_->CheckVideoDecoderFormat(&kAmdMjpeg, format, &supported)) || !supported)
+            throw Failure{ROCJPEG_STATUS_JPEG_NOT_SUPPORTED};
+        UINT count = 0;
+        if (FAILED(video_device_->GetVideoDecoderConfigCount(&desc, &count)) || !count)
+            throw Failure{ROCJPEG_STATUS_JPEG_NOT_SUPPORTED};
+        D3D11_VIDEO_DECODER_CONFIG config{};
+        bool found = false;
+        for (UINT i = 0; i < count; ++i) {
+            Check(video_device_->GetVideoDecoderConfig(&desc, i, &config));
+            if (config.ConfigBitstreamRaw == 1 && config.guidConfigBitstreamEncryption == DXVA_NoEncrypt) {
+                found = true; break;
+            }
+        }
+        if (!found) throw Failure{ROCJPEG_STATUS_IMPLEMENTATION_NOT_SUPPORTED};
+        auto session = std::make_shared<DecodeSession>();
+        session->width = width; session->height = height; session->format = format;
+        Check(video_device_->CreateVideoDecoder(&desc, &config, &session->decoder));
+        D3D11_TEXTURE2D_DESC texture{};
+        texture.Width = desc.SampleWidth; texture.Height = desc.SampleHeight;
+        texture.MipLevels = texture.ArraySize = texture.SampleDesc.Count = 1;
+        texture.Format = format;
+        texture.BindFlags = D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
+        texture.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+        Check(device11_->CreateTexture2D(&texture, nullptr, &session->texture));
+        D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC view{};
+        view.DecodeProfile = kAmdMjpeg;
+        view.ViewDimension = D3D11_VDOV_DIMENSION_TEXTURE2D;
+        Check(video_device_->CreateVideoDecoderOutputView(session->texture.Get(), &view, &session->output));
+        return session;
+    }
+
+    D3D11_VIDEO_DECODER_BUFFER_DESC Upload(ID3D11VideoDecoder* decoder,
+                                           D3D11_VIDEO_DECODER_BUFFER_TYPE type,
+                                           const void* data, size_t size) {
+        UINT capacity = 0;
+        void* buffer = nullptr;
+        Check(video_context_->GetDecoderBuffer(decoder, type, &capacity, &buffer));
+        if (!buffer || size > capacity) {
+            (void)video_context_->ReleaseDecoderBuffer(decoder, type);
+            throw Failure{ROCJPEG_STATUS_JPEG_NOT_SUPPORTED};
+        }
+        std::memcpy(buffer, data, size);
+        Check(video_context_->ReleaseDecoderBuffer(decoder, type));
+        D3D11_VIDEO_DECODER_BUFFER_DESC desc{};
+        desc.BufferType = type;
+        desc.DataSize = static_cast<UINT>(size);
+        return desc;
+    }
+
+    bool WaitForDecode(const Submission& job) noexcept {
+        if (!job.completion) return true;
+        context11_->Flush();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            BOOL complete = FALSE;
+            const auto status = context11_->GetData(job.completion.Get(), &complete, sizeof(complete), 0);
+            if (status == S_OK && complete) return true;
+            if (FAILED(status)) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    }
+
     std::unique_ptr<Submission> Submit(const JpegStream& jpeg, const RocJpegDecodeParams& params, bool reuse) {
         if (jpeg.bytes.empty()) throw Failure{ROCJPEG_STATUS_BAD_JPEG};
-        if (jpeg.width < unsigned(min_width_) || jpeg.height < unsigned(min_height_) ||
-            jpeg.width > unsigned(max_width_) || jpeg.height > unsigned(max_height_))
+        if (jpeg.width > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION || jpeg.height > D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION)
             throw Failure{ROCJPEG_STATUS_JPEG_NOT_SUPPORTED};
         if (params.output_format < ROCJPEG_OUTPUT_NATIVE || params.output_format >= ROCJPEG_OUTPUT_FORMAT_MAX)
             throw Failure{ROCJPEG_STATUS_INVALID_PARAMETER};
-        // AMF advertises BGRA conversion, but the Windows driver can fault while
-        // initializing that path for 4:4:4 JPEG. Reject before entering the driver;
-        // silently reducing 4:4:4/4:4:0 chroma to NV12 would also lose image detail.
-        if (jpeg.subsampling == ROCJPEG_CSS_444 || jpeg.subsampling == ROCJPEG_CSS_440)
+        // This profile exposes NV12/YUY2. Reducing 4:4:4/4:4:0 chroma would lose
+        // image detail; let the application select its fallback instead.
+        // Its 4:0:0 output has an incorrect row layout on the validated driver
+        // (also present through AMF). Do not report a corrupt grayscale success.
+        if (jpeg.subsampling == ROCJPEG_CSS_444 || jpeg.subsampling == ROCJPEG_CSS_440 || jpeg.subsampling == ROCJPEG_CSS_400)
             throw Failure{ROCJPEG_STATUS_JPEG_NOT_SUPPORTED};
-        const amf::AMF_SURFACE_FORMAT format = jpeg.subsampling == ROCJPEG_CSS_422 ?
-            amf::AMF_SURFACE_YUY2 : amf::AMF_SURFACE_NV12;
+        // Never submit header-only streams or invalid/missing tables to the driver.
+        if (!jpeg.complete_tables) throw Failure{ROCJPEG_STATUS_BAD_JPEG};
+        const DXGI_FORMAT format = jpeg.subsampling == ROCJPEG_CSS_422 ? DXGI_FORMAT_YUY2 : DXGI_FORMAT_NV12;
         auto job = std::make_unique<Submission>();
         job->params = params;
         job->width = jpeg.width; job->height = jpeg.height;
-        job->subsampling = jpeg.subsampling; job->format = format;
-        if (!reuse) {
-            job->owns_decoder = true;
-            CheckAmf(factory_->CreateComponent(context_, AMFVideoDecoderUVD_MJPEG, &job->decoder));
-            CheckAmf(job->decoder->SetProperty(AMF_VIDEO_DECODER_REORDER_MODE, amf_int64(AMF_VIDEO_DECODER_MODE_LOW_LATENCY)));
-            CheckAmf(job->decoder->Init(format, jpeg.width, jpeg.height));
-        } else if (!decoder_initialized_ || width_ != jpeg.width || height_ != jpeg.height || format_ != format) {
-            if (decoder_initialized_) CheckAmf(decoder_->Terminate());
-            decoder_initialized_ = false;
-            CheckAmf(decoder_->SetProperty(AMF_VIDEO_DECODER_REORDER_MODE, amf_int64(AMF_VIDEO_DECODER_MODE_LOW_LATENCY)));
-            CheckAmf(decoder_->Init(format, jpeg.width, jpeg.height));
-            decoder_initialized_ = true;
-            width_ = jpeg.width; height_ = jpeg.height; format_ = format;
+        job->subsampling = jpeg.subsampling;
+        if (reuse) {
+            if (!reusable_ || reusable_->width != jpeg.width || reusable_->height != jpeg.height || reusable_->format != format)
+                reusable_ = CreateSession(jpeg.width, jpeg.height, format);
+            job->session = reusable_;
+        } else {
+            // Each in-flight output owns its surface; later submissions cannot
+            // overwrite it, even when sync calls arrive in a different order.
+            job->session = CreateSession(jpeg.width, jpeg.height, format);
         }
-        if (reuse) job->decoder = decoder_;
-        CheckAmf(context_->AllocBuffer(amf::AMF_MEMORY_HOST, jpeg.bytes.size(), &job->compressed));
-        std::memcpy(job->compressed->GetNative(), jpeg.bytes.data(), jpeg.bytes.size());
-        job->compressed->SetPts(0);
-        job->compressed->SetDuration(333333);
-        CheckAmf(job->decoder->SubmitInput(job->compressed));
+        D3D11_QUERY_DESC query{D3D11_QUERY_EVENT, 0};
+        Check(device11_->CreateQuery(&query, &job->completion));
+        auto* decoder = job->session->decoder.Get();
+        HRESULT begin;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        do {
+            begin = video_context_->DecoderBeginFrame(decoder, job->session->output.Get(), 0, nullptr);
+            if (begin != E_PENDING) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        } while (std::chrono::steady_clock::now() < deadline);
+        Check(begin);
+        try {
+            DXVA_PictureParameters picture{};
+            // Despite their legacy names, AMD's JPEG profile uses pixels here.
+            picture.wPicWidthInMBminus1 = static_cast<WORD>(jpeg.width - 1);
+            picture.wPicHeightInMBminus1 = static_cast<WORD>(jpeg.height - 1);
+            picture.bPicStructure = 3; // frame; zero selects a field and corrupts row layout
+            picture.bPicIntra = 1;
+            const std::array buffers{
+                Upload(decoder, D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, &picture, sizeof(picture)),
+                Upload(decoder, D3D11_VIDEO_DECODER_BUFFER_BITSTREAM, jpeg.bytes.data(), jpeg.bytes.size())};
+            Check(video_context_->SubmitDecoderBuffers(decoder, static_cast<UINT>(buffers.size()), buffers.data()));
+        } catch (...) {
+            (void)video_context_->DecoderEndFrame(decoder);
+            context11_->End(job->completion.Get());
+            (void)WaitForDecode(*job);
+            reusable_.reset();
+            throw;
+        }
+        Check(video_context_->DecoderEndFrame(decoder));
+        context11_->End(job->completion.Get());
+        context11_->Flush();
         return job;
     }
 
@@ -362,23 +497,7 @@ private:
         // the command allocator or overwrite its imported buffer before it finishes.
         CheckHip(hipStreamSynchronize(hip_stream_));
         if (!WaitForQueue()) return ROCJPEG_STATUS_EXECUTION_FAILED;
-        amf::AMFDataPtr output;
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        while (std::chrono::steady_clock::now() < deadline) {
-            const auto status = job.decoder->QueryOutput(&output);
-            if (output) { CheckAmf(status); break; }
-            if (status != AMF_REPEAT && status != AMF_OK) CheckAmf(status);
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        if (!output) {
-            (void)job.decoder->Flush();
-            return ROCJPEG_STATUS_EXECUTION_FAILED;
-        }
-        amf::AMFSurfacePtr surface(output);
-        if (!surface || surface->GetMemoryType() != amf::AMF_MEMORY_DX11 || surface->GetFormat() != job.format)
-            return ROCJPEG_STATUS_IMPLEMENTATION_NOT_SUPPORTED;
-        auto* texture = static_cast<ID3D11Texture2D*>(surface->GetPlaneAt(0)->GetNative());
-        if (!texture) return ROCJPEG_STATUS_EXECUTION_FAILED;
+        auto* texture = job.session->texture.Get();
         PrepareTransfer(texture);
         Check(allocator_->Reset());
         Check(commands_->Reset(allocator_.Get(), nullptr));
@@ -426,7 +545,7 @@ private:
         wait.params.fence.value = hip_ready;
         CheckHip(hipWaitExternalSemaphoresAsync(&hip_fence_, &wait, 1, hip_stream_));
         SurfaceView view{};
-        view.format = job.format == amf::AMF_SURFACE_NV12 ? SurfaceFormat::NV12 : SurfaceFormat::YUY2;
+        view.format = job.session->format == DXGI_FORMAT_NV12 ? SurfaceFormat::NV12 : SurfaceFormat::YUY2;
         view.width = job.width; view.height = job.height; view.chromaSubsampling = job.subsampling;
         for (unsigned p = 0; p < transfer_->planes; ++p) {
             view.planes[p] = transfer_->mapped + transfer_->layout[p].Offset;
@@ -450,8 +569,8 @@ private:
         next->planes = source.Format == DXGI_FORMAT_NV12 ? 2 : 1;
         auto shared_desc = source;
         shared_desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
-        // Starting with D3D11 is deliberate: AMF's NV12 allocation cannot be opened
-        // by D3D11 when the shared texture is instead created on D3D12.
+        // Create on D3D11 first: the driver cannot open a D3D12-created NV12
+        // allocation with the decoder's required bindings on this path.
         Check(device11_->CreateTexture2D(&shared_desc, nullptr, &next->texture11));
         ComPtr<IDXGIResource1> shared_resource;
         Check(next->texture11.As(&shared_resource));
@@ -501,10 +620,9 @@ private:
     int device_;
     hipStream_t hip_stream_ = nullptr;
     hipExternalSemaphore_t hip_fence_ = nullptr;
-    Module module_;
-    amf::AMFFactory* factory_ = nullptr;
-    amf::AMFContextPtr context_;
-    amf::AMFComponentPtr decoder_;
+    std::shared_ptr<DecodeSession> reusable_;
+    ComPtr<ID3D11VideoDevice> video_device_;
+    ComPtr<ID3D11VideoContext> video_context_;
     ComPtr<IDXGIAdapter1> adapter_;
     ComPtr<ID3D11Device> device11_;
     ComPtr<ID3D11Device5> device11_5_;
@@ -519,10 +637,6 @@ private:
     std::unique_ptr<TransferBuffer> transfer_;
     std::unordered_map<RocJpegImage*, std::unique_ptr<Submission>> pending_;
     uint64_t fence_value_ = 0, last_copy_ = 0;
-    amf_int32 min_width_ = 0, max_width_ = 0, min_height_ = 0, max_height_ = 0;
-    uint32_t width_ = 0, height_ = 0;
-    amf::AMF_SURFACE_FORMAT format_ = amf::AMF_SURFACE_UNKNOWN;
-    bool decoder_initialized_ = false;
 };
 } // namespace
 
