@@ -201,7 +201,12 @@ struct JpegStream {
                     return ROCJPEG_STATUS_JPEG_NOT_SUPPORTED;
                 pos += size; scan = true;
                 while (pos < length) {
-                    if (data[pos++] != 0xff) continue;
+                    // Entropy bytes have no structure until 0xff. The CRT's
+                    // vectorized search preserves marker validation without a
+                    // byte-at-a-time scan of the entire compressed image.
+                    const auto* marker_start = static_cast<const uint8_t*>(std::memchr(data + pos, 0xff, length - pos));
+                    if (!marker_start) break;
+                    pos = static_cast<size_t>(marker_start - data) + 1;
                     while (pos < length && data[pos] == 0xff) ++pos;
                     if (pos >= length) return ROCJPEG_STATUS_BAD_JPEG;
                     const uint8_t next = data[pos++];
@@ -241,6 +246,7 @@ struct DecodeSession {
     ComPtr<ID3D11VideoDecoder> decoder;
     ComPtr<ID3D11Texture2D> texture;
     ComPtr<ID3D11VideoDecoderOutputView> output;
+    ComPtr<ID3D11Query> completion;
     uint32_t width = 0, height = 0;
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 };
@@ -275,6 +281,8 @@ public:
     void Initialize() {
         DeviceScope scope(device_);
         CheckHip(hipStreamCreateWithFlags(&hip_stream_, hipStreamNonBlocking));
+        copy_complete_.value = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!copy_complete_.value) throw Failure{ROCJPEG_STATUS_OUTOF_MEMORY};
         char luid[8]{}; unsigned node_mask = 0;
         CheckHip(hipDeviceGetLuid(luid, &node_mask, device_));
         ComPtr<IDXGIFactory1> dxgi;
@@ -394,6 +402,8 @@ private:
         view.DecodeProfile = kAmdMjpeg;
         view.ViewDimension = D3D11_VDOV_DIMENSION_TEXTURE2D;
         Check(video_device_->CreateVideoDecoderOutputView(session->texture.Get(), &view, &session->output));
+        D3D11_QUERY_DESC query{D3D11_QUERY_EVENT, 0};
+        Check(device11_->CreateQuery(&query, &session->completion));
         return session;
     }
 
@@ -457,8 +467,7 @@ private:
             // overwrite it, even when sync calls arrive in a different order.
             job->session = CreateSession(jpeg.width, jpeg.height, format);
         }
-        D3D11_QUERY_DESC query{D3D11_QUERY_EVENT, 0};
-        Check(device11_->CreateQuery(&query, &job->completion));
+        job->completion = job->session->completion;
         auto* decoder = job->session->decoder.Get();
         HRESULT begin;
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -541,6 +550,11 @@ private:
         const uint64_t hip_ready = ++fence_value_;
         Check(queue_->Signal(fence12_.Get(), hip_ready));
         last_copy_ = hip_ready;
+        // Wait on the host before placing a fence wait on HIP's compute queue.
+        // This synchronous API would block the host below anyway. Keeping the
+        // unresolved video/copy fence off that queue lets training continue.
+        // Retain the HIP wait for external-memory acquire/visibility semantics.
+        if (!WaitForQueue()) return ROCJPEG_STATUS_EXECUTION_FAILED;
         hipExternalSemaphoreWaitParams wait{};
         wait.params.fence.value = hip_ready;
         CheckHip(hipWaitExternalSemaphoresAsync(&hip_fence_, &wait, 1, hip_stream_));
@@ -610,16 +624,16 @@ private:
 
     bool WaitForQueue() noexcept {
         if (!queue_ || !fence12_ || !last_copy_ || fence12_->GetCompletedValue() >= last_copy_) return true;
-        WinHandle event;
-        event.value = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (event.value && SUCCEEDED(fence12_->SetEventOnCompletion(last_copy_, event.value)))
-            return WaitForSingleObject(event.value, 10000) == WAIT_OBJECT_0;
+        if (copy_complete_.value && SUCCEEDED(fence12_->SetEventOnCompletion(last_copy_, copy_complete_.value)))
+            return WaitForSingleObject(copy_complete_.value, 10000) == WAIT_OBJECT_0 &&
+                   fence12_->GetCompletedValue() >= last_copy_;
         return false;
     }
 
     int device_;
     hipStream_t hip_stream_ = nullptr;
     hipExternalSemaphore_t hip_fence_ = nullptr;
+    WinHandle copy_complete_;
     std::shared_ptr<DecodeSession> reusable_;
     ComPtr<ID3D11VideoDevice> video_device_;
     ComPtr<ID3D11VideoContext> video_context_;

@@ -52,11 +52,24 @@ HIP external memory, and converted by HIP kernels. D3D11/D3D12 shared fences and
 HIP external semaphore waits order the copies. No decoded-pixel CPU readback is
 used by the library; only validation reads output pixels back.
 
+The synchronous completion path first waits for the D3D12 copy fence through a
+retained Win32 event. Only then does it enqueue the HIP external semaphore wait
+and conversion. The HIP wait remains necessary for external-memory ownership;
+moving the unresolved fence wait to the host avoids parking HIP compute work
+behind video/copy work while another application stream is training. This is
+analogous to Linux rocJPEG waiting for `vaSyncSurface` before HIP conversion.
+It does not change the asynchronous API's submit/sync contract.
+
 Synchronous calls reuse decoder and transfer resources. Each asynchronous
 submission owns a separate decoder/output surface, so input streams may be
 destroyed and different images may be completed in reverse order. Destination
 storage must remain alive until sync. Partial batch failure drains and removes
 the batch's submitted jobs. Destruction waits for pending video work.
+
+Decoder sessions also retain their D3D11 completion query. Reusing a JPEG stream
+retains its compressed-byte capacity; the parser uses a vectorized marker search
+while preserving entropy-marker and table validation. No synchronization or
+validation is skipped to obtain these savings.
 
 ## Validation
 
